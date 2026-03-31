@@ -1,0 +1,6 @@
+
+	studentized Breusch-Pagan test
+
+data:  baseline_model
+BP = 178.07, df = 5, p-value < 0.00000000000000022
+

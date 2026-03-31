@@ -1,0 +1,12 @@
+
+	Pearson's product-moment correlation
+
+data:  baseline_df$Trade and baseline_df$GDP_growth
+t = 8.7859, df = 2816, p-value < 0.00000000000000022
+alternative hypothesis: true correlation is not equal to 0
+95 percent confidence interval:
+ 0.1271843 0.1990650
+sample estimates:
+      cor 
+0.1633414 
+

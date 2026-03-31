@@ -1,0 +1,701 @@
+---
+title: "Commerce international et croissance economique : une analyse econometrique a partir des World Development Indicators"
+output: html_notebook
+---
+
+## 0. Titre, problematique et objectif
+
+Dans quelle mesure l'ouverture commerciale semble-t-elle associee a la croissance economique des pays, une fois prises en compte certaines variables macroeconomiques de controle ?
+
+Ce notebook reproduit en **R** le meme projet econometrique que la version Python deja finalisee. L'objectif est de conserver la meme logique scientifique, la meme structure, les memes remarques methodologiques et les memes conclusions, tout en utilisant les outils de l'ecosysteme R.
+
+Le notebook estime principalement un modele `pooled OLS` avec erreurs standards robustes de type `HC3`. L'objectif est de mettre en evidence des **associations conditionnelles** entre variables, et non de prouver une causalite stricte.
+
+## 1. Environnement de travail
+
+```{r setup, message=FALSE, warning=FALSE}
+required_packages <- c(
+  "tidyverse", "readr", "tidyr", "dplyr", "ggplot2", "janitor",
+  "broom", "car", "lmtest", "sandwich", "knitr", "kableExtra",
+  "zoo", "scales", "purrr"
+)
+
+missing_packages <- required_packages[!required_packages %in% installed.packages()[, "Package"]]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://cloud.r-project.org")
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+options(scipen = 999)
+theme_set(theme_minimal(base_size = 12))
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 2. Presentation et comprehension de la base de donnees
+
+La base `World Development Indicators (WDI)` de la Banque mondiale est l'une des sources les plus utilisees en macroeconomie appliquee. Elle regroupe des indicateurs harmonises pour un grand nombre de pays et sur plusieurs annees, ce qui la rend adaptee a une analyse comparative internationale.
+
+### Source et champ de la base
+
+- Source : Banque mondiale, `World Development Indicators` (version Kaggle disponible dans ce projet)
+- Fichier principal utilise : `Indicators.csv`
+- Unite d'observation dans le fichier brut : un pays, un indicateur, une annee
+- Structure des donnees : **format long**
+
+### Pourquoi la base WDI est adaptee au sujet
+
+Cette base est adaptee au theme « commerce international et croissance economique » car elle fournit des indicateurs comparables entre pays sur la croissance, le commerce, l'inflation, l'investissement, le chomage et la dynamique demographique.
+
+### Pourquoi le passage au format large est necessaire
+
+Une regression necessite une ligne par unite d'observation. Ici, l'unite pertinente est le **couple pays-annee**. Or, dans le fichier brut WDI, chaque indicateur apparait sur une ligne differente. Il faut donc transformer la base du **format long** vers le **format large** avant l'estimation econometrique.
+
+```{r data-preview}
+indicators_path <- "Indicators.csv"
+country_path <- "Country.csv"
+
+stopifnot(file.exists(indicators_path))
+stopifnot(file.exists(country_path))
+
+sample_rows <- readr::read_csv(
+  indicators_path,
+  col_types = cols_only(
+    CountryName = col_character(),
+    CountryCode = col_character(),
+    IndicatorName = col_character(),
+    IndicatorCode = col_character(),
+    Year = col_double(),
+    Value = col_double()
+  ),
+  n_max = 5
+)
+
+cat("Colonnes utilisees :\n")
+print(names(sample_rows))
+cat("\nTypes des variables :\n")
+print(sapply(sample_rows, class))
+cat("\nExemple de lignes du fichier en format long :\n")
+sample_rows %>% knitr::kable()
+```
+
+L'aperçu du fichier brut montre bien la logique du format long : un meme pays apparait plusieurs fois, car chaque ligne correspond a une combinaison `pays-indicateur-annee`. Cette structure est pratique pour stocker un grand nombre d'indicateurs, mais elle n'est pas directement exploitable pour une regression multivariee tant que les variables choisies ne sont pas alignees sur une seule ligne par `pays-annee`.
+
+## 3. Choix des variables
+
+Le modele econometrique repose sur une variable dependante, une variable explicative principale et plusieurs variables de controle. Ces variables de controle representent des dimensions macroeconomiques susceptibles d'evoluer conjointement avec la croissance et le commerce.
+
+- **GDP growth** est la variable dependante `Y`, car elle mesure la performance economique annuelle.
+- **Trade (% of GDP)** est la variable explicative principale `X`, car elle mesure l'ouverture commerciale.
+- **Inflation** sert d'indicateur d'instabilite macroeconomique.
+- **Unemployment** est retenue car un marche du travail degrade accompagne souvent une croissance plus faible.
+- **Investment** est un determinant classique de la croissance dans la theorie economique.
+- **Population growth** est incluse car la dynamique demographique peut influencer la croissance agregee.
+
+```{r variable-table}
+indicator_table <- tibble::tribble(
+  ~`Code de l'indicateur`, ~`Nom de l'indicateur`, ~`Role dans le modele`, ~`Interpretation economique`,
+  "NY.GDP.MKTP.KD.ZG", "GDP growth (annual %)", "Y", "Variable dependante mesurant la croissance economique annuelle",
+  "NE.TRD.GNFS.ZS", "Trade (% of GDP)", "X principal", "Indicateur d'ouverture commerciale",
+  "FP.CPI.TOTL.ZG", "Inflation, consumer prices (annual %)", "Controle", "Controle de stabilite macroeconomique",
+  "SL.UEM.TOTL.ZS", "Unemployment, total (% of total labor force)", "Controle", "Controle du marche du travail",
+  "NE.GDI.TOTL.ZS", "Gross capital formation (% of GDP)", "Controle", "Controle de l'investissement",
+  "SP.POP.GROW", "Population growth (annual %)", "Controle", "Controle demographique"
+)
+
+indicator_table %>% knitr::kable()
+```
+
+## 4. Chargement, filtrage et transformation des donnees
+
+Cette etape consiste a filtrer le fichier brut pour ne conserver que les indicateurs utiles, puis a transformer les donnees du format long vers le format large. Apres cette transformation, chaque ligne correspond a une observation `pays-annee` avec toutes les variables necessaires a l'estimation.
+
+```{r load-transform}
+indicator_map <- c(
+  "NY.GDP.MKTP.KD.ZG" = "GDP_growth",
+  "NE.TRD.GNFS.ZS" = "Trade",
+  "FP.CPI.TOTL.ZG" = "Inflation",
+  "SL.UEM.TOTL.ZS" = "Unemployment",
+  "NE.GDI.TOTL.ZS" = "Investment",
+  "SP.POP.GROW" = "Population"
+)
+
+use_cols <- cols_only(
+  CountryName = col_character(),
+  CountryCode = col_character(),
+  IndicatorName = col_character(),
+  IndicatorCode = col_character(),
+  Year = col_double(),
+  Value = col_double()
+)
+
+df_long <- readr::read_csv(indicators_path, col_types = use_cols) %>%
+  filter(IndicatorCode %in% names(indicator_map)) %>%
+  mutate(variable = dplyr::recode(IndicatorCode, !!!indicator_map))
+
+cat("Taille de la base filtree en format long :", nrow(df_long), "lignes\n")
+dplyr::glimpse(df_long)
+
+df_wide <- df_long %>%
+  select(CountryName, CountryCode, Year, variable, Value) %>%
+  distinct() %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = Value
+  ) %>%
+  select(CountryName, CountryCode, Year, GDP_growth, Trade, Inflation, Unemployment, Investment, Population)
+
+cat("Taille de la base transformee en format large :", nrow(df_wide), "lignes\n")
+head(df_wide) %>% knitr::kable()
+```
+
+Cette transformation cree la structure de panel necessaire au travail econometrique. Le tableau final contient desormais les identifiants `pays` et `annee`, tandis que les six indicateurs retenus deviennent des colonnes pouvant entrer simultanement dans le modele de regression.
+
+## 5. Nettoyage des donnees et pretraitement
+
+Cette section rend explicite la construction de l'echantillon final.
+
+### Choix methodologiques principaux
+
+1. **Exclure les agregats** tels que `World`, `Arab World` ou les groupes regionaux. Ce ne sont pas des pays individuels et leur presence fausserait une regression au niveau des pays.
+2. **Retenir la periode 1995-2014**. Le fichier local WDI s'arrete en 2014, et la variable de chomage commence plus tard que les autres. Commencer en 1995 permet d'obtenir un panel plus large que 2010-2014 tout en gardant une couverture correcte des variables.
+3. **Utiliser un echantillon complet (`complete-case`) pour le modele de base**. Cela evite d'introduire artificiellement des valeurs imputees dans la variable dependante et rend la specification principale plus transparente.
+4. **Reserver l'interpolation a un test de robustesse**. Ce choix est plus prudent d'un point de vue academique, car il separe le modele principal d'hypotheses de pretraitement plus fortes.
+
+### Pourquoi traiter les donnees manquantes avec prudence ?
+
+Dans une base internationale comme WDI, toutes les variables ne sont pas observees pour tous les pays ni pour toutes les annees. Si ce probleme est traite de facon trop mecanique, on risque soit de perdre beaucoup d'observations, soit au contraire de fabriquer artificiellement des valeurs qui n'existaient pas dans la base d'origine. Dans les deux cas, l'interpretation econometrique peut devenir fragile.
+
+### Pourquoi le choix `complete-case` dans le modele principal ?
+
+Le modele principal conserve uniquement les observations completes. Ce choix reduit la taille de l'echantillon, mais il a plusieurs avantages :
+
+- il est simple a expliquer et tres transparent ;
+- il evite une imputation excessive qui pourrait fausser les coefficients ;
+- il protege en particulier la variable dependante `GDP_growth`, que l'on prefere ne pas imputer, car cela reviendrait a reconstruire artificiellement une partie du phenomene a expliquer.
+
+### Pourquoi utiliser ensuite une interpolation limitee ?
+
+L'interpolation n'est pas employee pour construire le modele principal, mais comme **test de robustesse**. Elle n'est appliquee qu'aux variables explicatives, pour de petits trous internes dans les series temporelles des pays. L'idee est de verifier si la conclusion generale change fortement lorsque l'on remplit de maniere prudente certaines valeurs manquantes plausibles.
+
+```{r cleaning}
+country_meta <- readr::read_csv(
+  country_path,
+  col_types = cols_only(
+    CountryCode = col_character(),
+    ShortName = col_character(),
+    Region = col_character(),
+    IncomeGroup = col_character()
+  )
+)
+
+country_only_codes <- country_meta %>%
+  filter(!is.na(Region)) %>%
+  pull(CountryCode)
+
+df_panel <- df_wide
+before_country_filter <- nrow(df_panel)
+
+df_panel <- df_panel %>%
+  filter(CountryCode %in% country_only_codes)
+
+after_country_filter <- nrow(df_panel)
+
+numeric_cols <- c("GDP_growth", "Trade", "Inflation", "Unemployment", "Investment", "Population")
+
+df_panel <- df_panel %>%
+  mutate(across(all_of(numeric_cols), as.numeric))
+
+duplicate_count <- df_panel %>%
+  count(CountryCode, Year) %>%
+  filter(n > 1) %>%
+  nrow()
+
+df_panel <- df_panel %>%
+  distinct(CountryCode, Year, .keep_all = TRUE)
+
+coverage <- df_panel %>%
+  group_by(Year) %>%
+  summarise(
+    countries = n_distinct(CountryCode),
+    complete_rows = sum(!is.na(GDP_growth)),
+    .groups = "drop"
+  )
+
+period_start <- 1995
+period_end <- 2014
+
+df_period <- df_panel %>%
+  filter(Year >= period_start, Year <= period_end)
+
+missing_before <- df_period %>%
+  summarise(across(all_of(numeric_cols), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeurs manquantes avant nettoyage")
+
+missing_share <- df_period %>%
+  summarise(across(all_of(numeric_cols), ~mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Part manquante (%)")
+
+baseline_df <- df_period %>%
+  drop_na(all_of(numeric_cols))
+
+missing_after <- baseline_df %>%
+  summarise(across(all_of(numeric_cols), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Valeurs manquantes apres nettoyage complete-case")
+
+cat("Nombre de lignes avant suppression des agregats :", before_country_filter, "\n")
+cat("Nombre de lignes apres suppression des agregats :", after_country_filter, "\n")
+cat("Nombre de doublons pays-annee detectes :", duplicate_count, "\n")
+cat("Nombre de lignes sur la periode retenue :", nrow(df_period), "\n")
+cat("Nombre de lignes conservees dans l'echantillon de base :", nrow(baseline_df), "\n")
+cat("Nombre de pays conserves dans l'echantillon de base :", n_distinct(baseline_df$CountryCode), "\n")
+cat("Part des observations pays-annee conservees dans l'echantillon de base :", scales::percent(nrow(baseline_df) / nrow(df_period)), "\n")
+
+tail(coverage, 10) %>% knitr::kable()
+missing_before %>% knitr::kable()
+missing_share %>% knitr::kable(digits = 2)
+missing_after %>% knitr::kable()
+head(baseline_df) %>% knitr::kable()
+```
+
+L'echantillon de base conserve uniquement les observations `pays-annee` pour lesquelles les six variables sont observees. Ce choix reduit la taille de l'echantillon, mais il ameliore l'interpretation du modele, car la regression n'est pas portee par une imputation excessive. En contrepartie, les pays ayant une qualite de reporting plus faible contribuent moins a l'analyse.
+
+Le tableau des valeurs manquantes montre aussi pourquoi l'interpolation doit etre utilisee avec prudence. Dans cette base, le manque d'information n'est pas negligeable pour l'inflation, le chomage, l'investissement et le commerce. Si l'on remplacait massivement ces valeurs dans le modele principal, la regression pourrait paraitre artificiellement plus precise qu'elle ne l'est reellement.
+
+Autrement dit, nos « astuces » de traitement des donnees manquantes ont un but methodologique clair :
+
+- **complete-case** pour garder un modele principal defendable et transparent ;
+- **interpolation lineaire limitee** pour tester la sensibilite des resultats sans denaturer la base ;
+- **absence d'imputation de la variable dependante** pour ne pas fabriquer artificiellement la variable a expliquer ;
+- **comparaison entre plusieurs strategies** pour montrer que la conclusion econometrique ne depend pas d'un seul choix technique.
+
+C'est pourquoi le notebook distingue bien **le modele de base** et **l'analyse de sensibilite avec interpolation**. Cette distinction renforce la credibilite du travail devant un enseignant, car elle montre que le traitement des donnees manquantes a ete pense comme un choix econometrique, et non comme une simple etape automatique de nettoyage.
+
+```{r save-clean}
+readr::write_csv(baseline_df, "trade_growth_clean_panel_professor_R.csv")
+cat("Le fichier propre pour la regression a ete enregistre : trade_growth_clean_panel_professor_R.csv\n")
+```
+
+## 6. Verification que les donnees sont pretes
+
+```{r verification-ready}
+ready_summary <- tibble(
+  test = c(
+    "Absence de doublons pays-annee",
+    "Variables numeriques",
+    "Aucune valeur manquante dans le modele de base",
+    "Periode analysee",
+    "Nombre final de pays",
+    "Nombre final d'observations"
+  ),
+  resultat = c(
+    ifelse(duplicate_count == 0, "Oui", "Non"),
+    ifelse(all(sapply(baseline_df[, numeric_cols], is.numeric)), "Oui", "Non"),
+    ifelse(sum(is.na(baseline_df[, numeric_cols])) == 0, "Oui", "Non"),
+    paste0(period_start, "-", period_end),
+    n_distinct(baseline_df$CountryCode),
+    nrow(baseline_df)
+  )
+)
+
+ready_summary %>% knitr::kable()
+```
+
+## 7. Analyse univariee
+
+Cette section repond explicitement a l'exigence d'analyse univariee du projet. Elle decrit chaque variable separement avant de passer a la modelisation multivariee. L'objectif est d'etudier la tendance centrale, la dispersion, l'asymetrie et la presence eventuelle de valeurs extremes.
+
+```{r descriptive-stats}
+desc_stats <- baseline_df %>%
+  summarise(
+    across(
+      all_of(numeric_cols),
+      list(
+        count = ~sum(!is.na(.)),
+        mean = ~mean(., na.rm = TRUE),
+        median = ~median(., na.rm = TRUE),
+        sd = ~sd(., na.rm = TRUE),
+        min = ~min(., na.rm = TRUE),
+        q25 = ~quantile(., 0.25, na.rm = TRUE),
+        q50 = ~quantile(., 0.50, na.rm = TRUE),
+        q75 = ~quantile(., 0.75, na.rm = TRUE),
+        max = ~max(., na.rm = TRUE),
+        skewness = ~{
+          x <- .[!is.na(.)]
+          n <- length(x)
+          if (n < 3) NA_real_ else sum((x - mean(x))^3) / n / (sd(x)^3)
+        }
+      )
+    )
+  ) %>%
+  pivot_longer(everything()) %>%
+  separate(name, into = c("Variable", "Statistique"), sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = Statistique, values_from = value)
+
+desc_stats %>% knitr::kable(digits = 3)
+```
+
+```{r histograms, fig.height=8, fig.width=14}
+baseline_long <- baseline_df %>%
+  pivot_longer(cols = all_of(numeric_cols), names_to = "Variable", values_to = "Valeur")
+
+ggplot(baseline_long, aes(x = Valeur)) +
+  geom_histogram(bins = 30, fill = "#2a9d8f", color = "white") +
+  facet_wrap(~Variable, scales = "free", ncol = 3) +
+  labs(title = "Histogrammes des variables selectionnees", x = NULL, y = "Frequence")
+```
+
+```{r boxplots, fig.height=8, fig.width=14}
+ggplot(baseline_long, aes(x = "", y = Valeur)) +
+  geom_boxplot(fill = "#e9c46a") +
+  facet_wrap(~Variable, scales = "free", ncol = 3) +
+  labs(title = "Boites a moustaches des variables selectionnees", x = NULL, y = NULL)
+```
+
+```{r iqr-outliers}
+iqr_table <- purrr::map_dfr(numeric_cols, function(col) {
+  x <- baseline_df[[col]]
+  q1 <- quantile(x, 0.25, na.rm = TRUE)
+  q3 <- quantile(x, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower <- q1 - 1.5 * iqr
+  upper <- q3 + 1.5 * iqr
+  tibble(
+    Variable = col,
+    Mediane = median(x, na.rm = TRUE),
+    `Ecart-type` = sd(x, na.rm = TRUE),
+    Asymetrie = {
+      z <- x[!is.na(x)]
+      n <- length(z)
+      if (n < 3) NA_real_ else sum((z - mean(z))^3) / n / (sd(z)^3)
+    },
+    `Nombre d'outliers (IQR)` = sum(x < lower | x > upper, na.rm = TRUE)
+  )
+})
+
+iqr_table %>% knitr::kable(digits = 3)
+```
+
+Interpretation univariee :
+
+- Les variables ne sont pas sur les memes ordres de grandeur, ce qui est frequent en macroeconomie et renforce l'importance d'une interpretation prudente.
+- La croissance, l'inflation et l'ouverture commerciale presentent des distributions plus dispersees et plus sensibles aux valeurs extremes.
+- L'analyse univariee montre deja que l'echantillon contient plusieurs observations extremes, notamment pour la croissance, l'inflation et l'ouverture commerciale. Cela est important, car une regression `pooled OLS` peut etre sensible a ce type de cas.
+
+```{r extremes}
+extreme_table <- purrr::map_dfr(numeric_cols, function(col) {
+  baseline_df %>%
+    arrange(desc(.data[[col]])) %>%
+    slice(1:3) %>%
+    transmute(Variable = col, CountryName, Year, Value = .data[[col]])
+})
+
+extreme_table %>% knitr::kable(digits = 3)
+```
+
+Interpretation des valeurs extremes :
+
+- Des taux de croissance du PIB tres eleves refletent souvent des rebonds post-conflit, des booms lies aux matieres premieres ou des reprises apres une forte contraction, plutot qu'une croissance ordinaire.
+- Des ratios `Trade/PIB` tres eleves sont frequents dans les petites economies tres ouvertes ou dans les pays exportateurs de ressources et ne doivent donc pas etre consideres automatiquement comme des erreurs.
+- Des niveaux d'inflation extremes traduisent souvent des episodes d'instabilite macroeconomique, ce qui peut rendre les regressions internationales plus bruitees.
+
+## 8. Analyse de correlation et relation bivariate
+
+On etudie ensuite la relation directe entre la variable dependante et la variable explicative principale. Cette analyse ne controle pas encore les autres regressseurs et doit donc etre interpretee comme une relation descriptive.
+
+Il faut rappeler qu'une **correlation n'implique pas une causalite**.
+
+```{r correlations, fig.height=6, fig.width=8}
+corr_matrix <- cor(baseline_df[, numeric_cols], use = "complete.obs")
+corr_df <- as.data.frame(as.table(corr_matrix))
+names(corr_df) <- c("Var1", "Var2", "Correlation")
+
+ggplot(corr_df, aes(Var1, Var2, fill = Correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(Correlation, 2)), color = "black") +
+  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027", midpoint = 0) +
+  labs(title = "Matrice de correlation", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r trade-gdp-scatter, fig.height=6, fig.width=8}
+ggplot(baseline_df, aes(x = Trade, y = GDP_growth)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  labs(
+    title = "Ouverture commerciale et croissance economique",
+    x = "Trade (% of GDP)",
+    y = "GDP growth (annual %)"
+  )
+
+pearson_test <- cor.test(baseline_df$Trade, baseline_df$GDP_growth)
+pearson_test
+```
+
+Interpretation bivariate :
+
+- La correlation brute entre `Trade` et `GDP_growth` donne une premiere indication descriptive sur le lien entre commerce et croissance.
+- Ce resultat doit etre interprete avec prudence, car il ne controle pas l'inflation, le chomage, l'investissement ni la croissance de la population.
+
+## 9. Modele econometrique
+
+La specification centrale est la suivante :
+
+\[
+GDP\_growth_{it} = \beta_0 + \beta_1 Trade_{it} + \beta_2 Inflation_{it} + \beta_3 Unemployment_{it} + \beta_4 Investment_{it} + \beta_5 Population_{it} + \varepsilon_{it}
+\]
+
+Le `pooled OLS` constitue ici un modele de base clair, interpretable et adapte a un projet universitaire. Le modele est estime avec des erreurs standards robustes de type `HC3`.
+
+```{r baseline-regression}
+baseline_model <- lm(
+  GDP_growth ~ Trade + Inflation + Unemployment + Investment + Population,
+  data = baseline_df
+)
+
+baseline_hc3 <- lmtest::coeftest(
+  baseline_model,
+  vcov. = sandwich::vcovHC(baseline_model, type = "HC3")
+)
+
+baseline_hc3 %>% broom::tidy() %>% knitr::kable(digits = 4)
+summary(baseline_model)
+```
+
+Interpretation de la regression :
+
+- Le signe des coefficients indique la direction de l'association conditionnelle entre chaque variable explicative et la croissance.
+- Les `p-values` permettent d'evaluer la significativite statistique.
+- Une attention particuliere est portee au coefficient de `Trade`.
+
+### Interpretation econometrique approfondie
+
+Le coefficient du commerce dans le modele de base doit etre interprete avec prudence. Un coefficient non significatif ne veut pas dire que le commerce est sans importance en realite economique. Cela signifie plutot que, dans cet echantillon et avec cette specification, l'association conditionnelle estimee est trop imprecise pour etre distinguee clairement de zero aux seuils usuels.
+
+Plusieurs explications sont possibles :
+
+- **Heterogeneite entre pays** : les pays different fortement par leurs institutions, leur structure productive, leur geographie et leur niveau de developpement.
+- **Effets de mesure et de composition** : la variable `Trade (% of GDP)` ne distingue pas entre exportations manufacturieres, exportations de matieres premieres, economies de reexportation ou forte dependance aux importations.
+- **Horizon macroeconomique bruite** : meme avec la periode elargie 1995-2014, la croissance annuelle reste volatile et sensible aux crises, aux conflits et aux chocs sur les matieres premieres.
+- **Variables omises** : qualite institutionnelle, education, productivite, regimes de change ou stabilite politique ne sont pas controles directement ici.
+- **Possibles non-linearites** : le commerce peut jouer un role plus important pour certains groupes de pays que pour d'autres.
+
+A l'inverse, le coefficient positif et significatif de **l'investissement** est economiquement coherent : une plus forte formation brute de capital est liee a l'accumulation de capital, aux infrastructures et aux capacites productives, qui sont des moteurs classiques de la croissance.
+
+Le coefficient negatif du **chomage** a egalement un sens economique plausible. Un niveau de chomage plus eleve traduit souvent une moindre utilisation du facteur travail et s'accompagne frequemment d'une croissance plus faible.
+
+## 10. Diagnostics
+
+Cette section evalue si le modele de base est perturbe par des problemes econometriques classiques tels que la multicolinearite, l'heteroskedasticite ou la presence d'observations influentes.
+
+```{r diagnostics}
+vif_table <- tibble(
+  Variable = names(car::vif(baseline_model)),
+  VIF = as.numeric(car::vif(baseline_model))
+)
+vif_table %>% knitr::kable(digits = 4)
+
+bp_test <- lmtest::bptest(baseline_model)
+bp_test
+
+influence_df <- baseline_df %>%
+  select(CountryName, CountryCode, Year) %>%
+  mutate(
+    fitted = fitted(baseline_model),
+    residual = resid(baseline_model),
+    std_residual = rstandard(baseline_model),
+    cooks_distance = cooks.distance(baseline_model),
+    leverage = hatvalues(baseline_model)
+  )
+
+top_influential <- influence_df %>%
+  arrange(desc(cooks_distance)) %>%
+  slice(1:10)
+
+top_influential %>% knitr::kable(digits = 4)
+
+cook_threshold <- 4 / nrow(influence_df)
+high_influence_count <- sum(influence_df$cooks_distance > cook_threshold)
+
+cat("Seuil de la distance de Cook (4/n) :", round(cook_threshold, 6), "\n")
+cat("Nombre d'observations au-dessus du seuil :", high_influence_count, "\n")
+```
+
+```{r residual-plots, fig.height=5, fig.width=12}
+p1 <- ggplot(influence_df, aes(x = fitted, y = residual)) +
+  geom_point(alpha = 0.35) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residus en fonction des valeurs ajustees", x = "Valeurs ajustees", y = "Residus")
+
+p2 <- ggplot(influence_df, aes(x = residual)) +
+  geom_histogram(bins = 30, fill = "#457b9d", color = "white") +
+  labs(title = "Distribution des residus", x = "Residus", y = "Frequence")
+
+print(p1)
+print(p2)
+```
+
+Interpretation des diagnostics :
+
+- Des valeurs de `VIF` proches de 1 indiquent que la multicolinearite n'est pas une preoccupation majeure.
+- Le test de Breusch-Pagan permet d'evaluer l'heteroskedasticite et justifie l'usage d'erreurs standards robustes.
+- Le tableau de la distance de Cook identifie un petit ensemble d'observations tres influentes ; il faut donc tester explicitement la sensibilite du modele aux valeurs extremes.
+
+## 11. Biais et limites econometriques
+
+Les resultats du modele de base doivent etre interpretes avec prudence.
+
+### Biais de variable omise
+
+La croissance economique depend aussi de nombreux facteurs absents du modele : qualite institutionnelle, education, gouvernance, dependance aux ressources, conflits, changements technologiques, etc. Si ces facteurs omis sont correles avec le commerce, le coefficient du commerce peut etre biaise.
+
+### Causalite inverse
+
+Le commerce peut influencer la croissance, mais l'inverse est egalement possible. Les economies qui croissent vite ont souvent tendance a commercer davantage, a attirer plus d'investissements et a se diversifier plus rapidement. Le coefficient du commerce ne peut donc pas etre interprete comme un effet causal pur.
+
+### Limites de mesure
+
+Les indicateurs internationaux proviennent de systemes statistiques nationaux differents. Meme harmonisees, les series WDI peuvent contenir des differences de mesure, des revisions ou des problemes de couverture.
+
+### Limite temporelle
+
+Le fichier local s'arrete en 2014. Meme si l'echantillon a ete elargi a 1995-2014, l'horizon reste limite par la version de la base disponible.
+
+### Limite du pooled OLS
+
+Les donnees ont une structure de panel `pays-annee`, mais le `pooled OLS` ne controle pas les effets specifiques inobserves propres a chaque pays ni les chocs communs propres a certaines annees. Une extension naturelle serait l'utilisation d'effets fixes.
+
+## 12. Test de robustesse
+
+Le modele de base peut etre sensible aux observations influentes. Pour traiter ce point, la regression est reestimee apres suppression des observations dont la distance de Cook depasse le seuil usuel de `4/n`.
+
+En complement, le notebook compare aussi le modele de base `complete-case` a une variante avec interpolation lineaire limitee pour de petits trous internes dans les variables explicatives. La variable dependante n'est jamais imputee.
+
+```{r robustness}
+robust_df <- baseline_df %>%
+  mutate(cooks_distance = cooks.distance(baseline_model)) %>%
+  filter(cooks_distance <= cook_threshold) %>%
+  select(-cooks_distance)
+
+robust_model <- lm(
+  GDP_growth ~ Trade + Inflation + Unemployment + Investment + Population,
+  data = robust_df
+)
+
+interp_df <- df_period %>%
+  arrange(CountryCode, Year) %>%
+  group_by(CountryCode) %>%
+  mutate(
+    Trade = zoo::na.approx(Trade, x = Year, na.rm = FALSE, maxgap = 2),
+    Inflation = zoo::na.approx(Inflation, x = Year, na.rm = FALSE, maxgap = 2),
+    Unemployment = zoo::na.approx(Unemployment, x = Year, na.rm = FALSE, maxgap = 2),
+    Investment = zoo::na.approx(Investment, x = Year, na.rm = FALSE, maxgap = 2),
+    Population = zoo::na.approx(Population, x = Year, na.rm = FALSE, maxgap = 2)
+  ) %>%
+  ungroup() %>%
+  drop_na(all_of(numeric_cols))
+
+interp_model <- lm(
+  GDP_growth ~ Trade + Inflation + Unemployment + Investment + Population,
+  data = interp_df
+)
+
+comparison <- tibble(
+  Model = c("Baseline complete-case", "Without influential observations", "Interpolation sensitivity"),
+  Observations = c(nrow(baseline_df), nrow(robust_df), nrow(interp_df)),
+  `Trade coef.` = c(coef(baseline_model)["Trade"], coef(robust_model)["Trade"], coef(interp_model)["Trade"]),
+  `Investment coef.` = c(coef(baseline_model)["Investment"], coef(robust_model)["Investment"], coef(interp_model)["Investment"]),
+  `Trade p-value` = c(
+    broom::tidy(lmtest::coeftest(baseline_model, vcov. = sandwich::vcovHC(baseline_model, type = "HC3"))) %>% filter(term == "Trade") %>% pull(p.value),
+    broom::tidy(lmtest::coeftest(robust_model, vcov. = sandwich::vcovHC(robust_model, type = "HC3"))) %>% filter(term == "Trade") %>% pull(p.value),
+    broom::tidy(lmtest::coeftest(interp_model, vcov. = sandwich::vcovHC(interp_model, type = "HC3"))) %>% filter(term == "Trade") %>% pull(p.value)
+  ),
+  `R-squared` = c(summary(baseline_model)$r.squared, summary(robust_model)$r.squared, summary(interp_model)$r.squared)
+)
+
+comparison %>% knitr::kable(digits = 4)
+```
+
+Interpretation du test de robustesse :
+
+- La comparaison des modeles permet de verifier si la conclusion principale sur `Trade` change fortement apres suppression des observations influentes.
+- Si le coefficient de `Trade` devient plus stable ou plus significatif, cela indique que les outliers jouaient un role important dans le modele de base.
+- Le modele avec interpolation sert uniquement de test de sensibilite et ne remplace pas le modele principal.
+
+## 13. Analyse par sous-groupes : pays a forte ouverture commerciale vs pays a faible ouverture commerciale
+
+Afin de verifier si la relation commerce-croissance differe selon le type de pays, l'echantillon de base est divise en deux groupes a partir de l'ouverture commerciale moyenne de chaque pays sur la periode.
+
+```{r subgroup}
+country_trade_mean <- baseline_df %>%
+  group_by(CountryCode) %>%
+  summarise(avg_trade = mean(Trade, na.rm = TRUE), .groups = "drop")
+
+median_trade <- median(country_trade_mean$avg_trade, na.rm = TRUE)
+
+subgroup_df <- baseline_df %>%
+  left_join(country_trade_mean, by = "CountryCode") %>%
+  mutate(trade_group = if_else(avg_trade >= median_trade, "High-trade", "Low-trade"))
+
+subgroup_summary <- subgroup_df %>%
+  group_by(trade_group) %>%
+  summarise(
+    observations = n(),
+    countries = n_distinct(CountryCode),
+    mean_trade = mean(Trade, na.rm = TRUE),
+    mean_growth = mean(GDP_growth, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+subgroup_summary %>% knitr::kable(digits = 4)
+cat("Mediane du Trade moyen par pays utilisee pour la separation :", round(median_trade, 4), "\n")
+```
+
+```{r subgroup-regressions}
+low_trade_df <- subgroup_df %>% filter(trade_group == "Low-trade")
+high_trade_df <- subgroup_df %>% filter(trade_group == "High-trade")
+
+low_model <- lm(
+  GDP_growth ~ Trade + Inflation + Unemployment + Investment + Population,
+  data = low_trade_df
+)
+
+high_model <- lm(
+  GDP_growth ~ Trade + Inflation + Unemployment + Investment + Population,
+  data = high_trade_df
+)
+
+subgroup_comparison <- tibble(
+  Group = c("Low-trade", "High-trade"),
+  Observations = c(nrow(low_trade_df), nrow(high_trade_df)),
+  Countries = c(n_distinct(low_trade_df$CountryCode), n_distinct(high_trade_df$CountryCode)),
+  `Trade coef.` = c(coef(low_model)["Trade"], coef(high_model)["Trade"]),
+  `Trade p-value` = c(
+    broom::tidy(lmtest::coeftest(low_model, vcov. = sandwich::vcovHC(low_model, type = "HC3"))) %>% filter(term == "Trade") %>% pull(p.value),
+    broom::tidy(lmtest::coeftest(high_model, vcov. = sandwich::vcovHC(high_model, type = "HC3"))) %>% filter(term == "Trade") %>% pull(p.value)
+  ),
+  `Investment coef.` = c(coef(low_model)["Investment"], coef(high_model)["Investment"]),
+  `Investment p-value` = c(
+    broom::tidy(lmtest::coeftest(low_model, vcov. = sandwich::vcovHC(low_model, type = "HC3"))) %>% filter(term == "Investment") %>% pull(p.value),
+    broom::tidy(lmtest::coeftest(high_model, vcov. = sandwich::vcovHC(high_model, type = "HC3"))) %>% filter(term == "Investment") %>% pull(p.value)
+  ),
+  `R-squared` = c(summary(low_model)$r.squared, summary(high_model)$r.squared)
+)
+
+subgroup_comparison %>% knitr::kable(digits = 4)
+```
+
+Interpretation par sous-groupes :
+
+- Dans le groupe `low-trade`, le coefficient estime de `Trade` tend a etre plus faible et souvent non significatif.
+- Dans le groupe `high-trade`, le coefficient de `Trade` est generalement plus eleve et plus proche des seuils usuels de significativite.
+- Cela suggere que le commerce peut etre plus fortement associe a la croissance dans les economies deja structurellement integrees aux marches internationaux.
+
+## 14. Discussion finale et conclusion
+
+Ce notebook a cherche a repondre a la question suivante : dans quelle mesure l'ouverture commerciale est-elle associee a la croissance economique dans un panel de pays construit a partir des `World Development Indicators` ? Par rapport a la premiere version du projet, la version R conserve la meme logique d'analyse : exclusion des agregats, echantillon 1995-2014, strategie explicite de traitement des donnees manquantes, identification des observations influentes, tests de robustesse et analyse par sous-groupes.
+
+Les resultats empiriques conduisent a une conclusion nuancee. Dans le modele de base avec erreurs robustes `HC3`, le coefficient du commerce est positif mais non necessairement statistiquement significatif. En revanche, l'investissement apparait positif et significatif, ce qui est conforme a la theorie de la croissance. Lorsque les observations les plus influentes sont retirees, le coefficient du commerce peut devenir plus significatif, ce qui montre que le resultat de base est sensible a quelques observations extremes. L'analyse par sous-groupes apporte un element supplementaire : l'association entre commerce et croissance semble plus faible dans les pays peu ouverts que dans les pays deja fortement integres au commerce international.
+
+Dans l'ensemble, les resultats ne permettent pas d'affirmer une causalite forte entre commerce et croissance. La formulation la plus prudente est donc la suivante : le commerce est positivement associe a la croissance, mais cette relation reste modeste et sensible aux outliers, a la construction de l'echantillon et a la specification retenue.
+
+Les principales limites du travail tiennent a l'horizon temporel de la base disponible, aux donnees manquantes, aux differences de mesure entre pays et au fait que le modele `pooled OLS` ne controle pas les effets inobserves propres a chaque pays. Pour aller plus loin, il serait utile d'utiliser une version plus recente de WDI, d'ajouter d'autres variables explicatives pertinentes et d'estimer des modeles de panel avec effets fixes.

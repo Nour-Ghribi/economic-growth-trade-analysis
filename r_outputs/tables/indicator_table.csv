@@ -1,0 +1,7 @@
+IndicatorCode,IndicatorName,Role,Interpretation
+NY.GDP.MKTP.KD.ZG,GDP growth (annual %),Y,Croissance economique annuelle
+NE.TRD.GNFS.ZS,Trade (% of GDP),X principal,Ouverture commerciale
+FP.CPI.TOTL.ZG,"Inflation, consumer prices (annual %)",Controle,Stabilite macroeconomique
+SL.UEM.TOTL.ZS,"Unemployment, total (% of total labor force)",Controle,Marche du travail
+NE.GDI.TOTL.ZS,Gross capital formation (% of GDP),Controle,Investissement
+SP.POP.GROW,Population growth (annual %),Controle,Dynamique demographique

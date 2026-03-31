@@ -1,0 +1,16 @@
+__pycache__/
+.ipynb_checkpoints/
+.Rhistory
+.RData
+.Rproj.user/
+
+# Large raw datasets
+Indicators.csv
+database.sqlite
+Footnotes.csv
+CountryNotes.csv
+SeriesNotes.csv
+
+# Optional generated outputs
+hashes.txt
+

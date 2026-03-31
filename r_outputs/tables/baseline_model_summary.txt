@@ -1,0 +1,24 @@
+
+Call:
+lm(formula = GDP_growth ~ Trade + Inflation + Unemployment + 
+    Investment + Population, data = baseline_df)
+
+Residuals:
+    Min      1Q  Median      3Q     Max 
+-37.295  -1.973   0.024   1.968 118.457 
+
+Coefficients:
+                Estimate  Std. Error t value             Pr(>|t|)    
+(Intercept)  -1.75199494  0.29252457  -5.989        0.00000000238 ***
+Trade         0.00309046  0.00174146   1.775               0.0761 .  
+Inflation    -0.00004257  0.00110171  -0.039               0.9692    
+Unemployment -0.01756068  0.01477442  -1.189               0.2347    
+Investment    0.20279951  0.00898751  22.565 < 0.0000000000000002 ***
+Population    0.60885991  0.06400298   9.513 < 0.0000000000000002 ***
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 4.936 on 2812 degrees of freedom
+Multiple R-squared:  0.2062,	Adjusted R-squared:  0.2048 
+F-statistic: 146.1 on 5 and 2812 DF,  p-value: < 0.00000000000000022
+

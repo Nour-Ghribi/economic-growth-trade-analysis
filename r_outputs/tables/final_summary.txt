@@ -1,0 +1,6 @@
+Question de recherche : dans quelle mesure l'ouverture commerciale est-elle associee a la croissance economique ?
+Le modele principal est un pooled OLS avec erreurs standards robustes HC3.
+Le modele de base repose sur un echantillon complete-case pour eviter une imputation excessive.
+L'investissement apparait generalement comme une variable positive et significative.
+L'effet du commerce est plus fragile et peut dependre des observations influentes et du groupe de pays considere.
+Le travail doit etre interprete comme une analyse d'association conditionnelle et non comme une preuve de causalite.
